@@ -1,6 +1,9 @@
 import axios from 'axios';
 
-const API_BASE_URL = 'http://localhost:8001/api';
+let API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8001/api';
+if (API_BASE_URL && !API_BASE_URL.startsWith('http')) {
+  API_BASE_URL = `https://${API_BASE_URL}/api`;
+}
 
 const client = {
   uploadFiles: async (document, guideline) => {

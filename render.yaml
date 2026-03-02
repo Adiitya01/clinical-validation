@@ -1,0 +1,30 @@
+# Render Blueprints for Regulatory Validator Project
+services:
+  # ── Backend: FastAPI Precision Engine ──────────────────────────────────────
+  - type: web
+    name: regulatory-validator-backend
+    env: python
+    buildCommand: "cd backend && pip install -r requirements.txt"
+    startCommand: "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: GOOGLE_API_KEY
+        sync: false # Set in Render dashboard
+      - key: PYTHON_VERSION
+        value: 3.10.0 # Standard stable version
+
+  # ── Frontend: React Intelligence Dashboard ────────────────────────────────
+  - type: static
+    name: regulatory-validator-frontend
+    env: static
+    buildCommand: "cd frontend && npm install && npm run build"
+    staticPublishPath: "frontend/dist"
+    envVars:
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: regulatory-validator-backend
+          property: host
+    routes:
+      - type: rewrite
+        source: "/*"
+        destination: "/index.html"
