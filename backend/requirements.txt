@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+google-genai
+aiosqlite
+python-docx
+python-multipart
+python-dotenv
+pydantic
+pydantic-settings
+asyncio
+aiofiles
+PyPDF2
+grpcio>=1.66.0
