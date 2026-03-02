@@ -1,8 +1,18 @@
 import axios from 'axios';
 
-let API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8001/api';
-if (API_BASE_URL && !API_BASE_URL.startsWith('http')) {
-  API_BASE_URL = `https://${API_BASE_URL}/api`;
+let VITE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8001/api';
+
+// 1. Ensure it starts with https:// if not localhost and doesn't already have a protocol
+if (!VITE_URL.startsWith('http')) {
+  VITE_URL = `https://${VITE_URL}`;
+}
+
+// 2. Trim trailing slashes for clean construction
+let API_BASE_URL = VITE_URL.replace(/\/$/, "");
+
+// 3. Ensure it ends with /api (if the backend is structured that way)
+if (!API_BASE_URL.endsWith('/api') && !API_BASE_URL.includes('/api/')) {
+  API_BASE_URL = `${API_BASE_URL}/api`;
 }
 
 const client = {
