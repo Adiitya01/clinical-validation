@@ -41,8 +41,8 @@ function App() {
 
         await client.startPipeline(uploadData.session_id);
 
-        // Polling loop for this specific item
-        await pollItemStatus(i, uploadData.session_id);
+        // Watch status via WebSocket
+        await watchItemStatus(i, uploadData.session_id);
 
       } catch (error) {
         console.error(error);
@@ -61,28 +61,37 @@ function App() {
     });
   };
 
-  const pollItemStatus = (index, sessionId) => {
+  const watchItemStatus = (index, sessionId) => {
     return new Promise((resolve) => {
-      const interval = setInterval(async () => {
-        try {
-          const statusData = await client.getStatus(sessionId);
-          updateItemStatus(index, { status: statusData.status });
+      const ws = client.openStatusSocket(sessionId);
 
-          if (statusData.status === 'COMPLETED') {
+      ws.onmessage = async (event) => {
+        try {
+          const { type, status } = JSON.parse(event.data);
+          if (type !== 'status') return;
+          updateItemStatus(index, { status });
+
+          if (status === 'COMPLETED') {
+            ws.close();
             const resultsData = await client.getResults(sessionId);
             updateItemStatus(index, { results: resultsData, status: 'COMPLETED' });
-            clearInterval(interval);
             resolve();
-          } else if (statusData.status.startsWith('FAILED')) {
-            clearInterval(interval);
+          } else if (status.startsWith('FAILED')) {
+            ws.close();
             resolve();
           }
-        } catch (error) {
-          console.error(error);
-          clearInterval(interval);
-          resolve();
+        } catch (err) {
+          console.error(err);
         }
-      }, 3000);
+      };
+
+      ws.onerror = (err) => {
+        console.error('WebSocket error', err);
+        ws.close();
+        resolve();
+      };
+
+      ws.onclose = () => resolve();
     });
   };
 

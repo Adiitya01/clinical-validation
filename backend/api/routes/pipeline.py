@@ -2,17 +2,47 @@
 Pipeline Route — Manages background validation jobs and status tracking.
 """
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
 from core.validator import ValidationPipeline
 import os
 import json
 import logging
 import aiosqlite
+from typing import Dict, Set
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 pipeline = ValidationPipeline()
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.connections: Dict[str, Set[WebSocket]] = {}
+
+    async def connect(self, session_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.connections.setdefault(session_id, set()).add(websocket)
+
+    def disconnect(self, session_id: str, websocket: WebSocket):
+        if session_id in self.connections:
+            self.connections[session_id].discard(websocket)
+            if not self.connections[session_id]:
+                del self.connections[session_id]
+
+    async def broadcast(self, session_id: str, message: dict):
+        sockets = self.connections.get(session_id, set()).copy()
+        dead = set()
+        for ws in sockets:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.add(ws)
+        for ws in dead:
+            self.disconnect(session_id, ws)
+
+
+manager = ConnectionManager()
 
 DB_PATH = "reg_validator.db"
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".dcx"}
@@ -61,9 +91,10 @@ async def process_validation(session_id: str):
             gui_name = meta.get("guideline_name", gui_name)
 
     try:
-        # Status callback to update DB in real-time
+        # Status callback to update DB and push via WebSocket
         async def status_callback(status: str):
             await _update_session_status(session_id, status)
+            await manager.broadcast(session_id, {"type": "status", "status": status})
 
         # Run the full pipeline
         result_package = await pipeline.run(
@@ -97,12 +128,15 @@ async def process_validation(session_id: str):
         with open(output_path, "w") as f:
             json.dump(result_package, f, indent=2)
 
+        await manager.broadcast(session_id, {"type": "status", "status": "COMPLETED"})
         logger.info(f"Session {session_id} completed successfully.")
 
     except Exception as e:
         logger.error(f"Session {session_id} failed: {e}", exc_info=True)
-        error_msg = str(e)[:200]  # Truncate very long errors
-        await _update_session_status(session_id, f"FAILED: {error_msg}")
+        error_msg = str(e)[:200]
+        failed_status = f"FAILED: {error_msg}"
+        await _update_session_status(session_id, failed_status)
+        await manager.broadcast(session_id, {"type": "status", "status": failed_status})
 
 
 @router.post("/{session_id}/start")
@@ -169,3 +203,27 @@ async def get_results(session_id: str):
                 "consistency_score": row["consistency_score"],
                 "pipeline": pipeline_meta,
             }
+
+
+@router.websocket("/{session_id}/ws")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint — pushes status updates in real-time."""
+    await manager.connect(session_id, websocket)
+    try:
+        # Send current status immediately so the client doesn't wait
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT status FROM sessions WHERE id = ?", (session_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    await websocket.send_json({"type": "status", "status": row["status"]})
+
+        # Keep connection open until client disconnects
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(session_id, websocket)
+    except Exception:
+        manager.disconnect(session_id, websocket)

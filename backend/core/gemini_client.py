@@ -2,7 +2,8 @@ from google import genai
 from google.genai import types
 import os
 import json
-import time
+import asyncio
+import re
 import logging
 from dotenv import load_dotenv
 
@@ -101,18 +102,28 @@ OUTPUT FORMAT — return ONLY valid JSON:
 """
 
 
+MIME_MAP = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".txt": "text/plain",
+    ".dcx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
 class GeminiClient:
     def __init__(self, model_name="gemini-2.5-flash"):
-        api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = os.getenv("VERTEX_API_KEY")
         if not api_key:
-            raise ValueError("GOOGLE_API_KEY environment variable is not set")
-            
-        self.client = genai.Client(api_key=api_key)
+            raise ValueError("VERTEX_API_KEY environment variable is not set")
+
+        # Vertex AI Express Mode: API key auth against the Vertex AI endpoint
+        self.client = genai.Client(vertexai=True, api_key=api_key)
         self.model_name = model_name
         self.max_retries = 3
 
-    def _upload_file(self, file_path: str, display_name: str) -> object:
-        """Upload a file to Gemini with retries."""
+    def _file_to_part(self, file_path: str) -> types.Part:
+        """Read a file from disk and return an inline Part for Vertex AI."""
         abs_path = os.path.abspath(file_path)
 
         if not os.path.exists(abs_path):
@@ -120,38 +131,37 @@ class GeminiClient:
         if os.path.getsize(abs_path) == 0:
             raise ValueError(f"File is empty: {abs_path}")
 
-        # Detect mime type
         ext = os.path.splitext(abs_path)[1].lower()
-        mime_map = {
-            ".pdf": "application/pdf",
-            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            ".doc": "application/msword",
-            ".txt": "text/plain"
-        }
-        # Default to octet-stream for unknown (like .dcx if it's proprietary) 
-        # but if the user says "word format", .docx mime type is the best bet for .dcx too if it's just a typo.
-        mime_type = mime_map.get(ext, "application/octet-stream")
-        if ext == ".dcx":
-            mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        mime_type = MIME_MAP.get(ext, "application/octet-stream")
 
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                logger.info(f"Uploading {display_name} (attempt {attempt}, type {mime_type}): {abs_path}")
-                # The new SDK uses a different method for file uploads
-                uploaded = self.client.files.upload(
-                    file=abs_path,
-                    config=types.UploadFileConfig(
-                        mime_type=mime_type,
-                        display_name=display_name
-                    )
-                )
-                logger.info(f"Upload successful: {uploaded.name}")
-                return uploaded
-            except Exception as e:
-                logger.warning(f"Upload attempt {attempt} failed: {e}")
-                if attempt == self.max_retries:
-                    raise RuntimeError(f"Failed to upload {display_name} after {self.max_retries} attempts: {e}")
-                time.sleep(2 ** attempt)  # Exponential backoff
+        with open(abs_path, "rb") as f:
+            data = f.read()
+
+        logger.info(f"Loaded {abs_path} as inline bytes ({len(data)} bytes, {mime_type})")
+        return types.Part.from_bytes(data=data, mime_type=mime_type)
+
+    def _fix_json_newlines(self, text: str) -> str:
+        """Escape literal newlines/carriage returns inside JSON string values."""
+        result = []
+        in_string = False
+        escape_next = False
+        for ch in text:
+            if escape_next:
+                result.append(ch)
+                escape_next = False
+            elif ch == '\\' and in_string:
+                result.append(ch)
+                escape_next = True
+            elif ch == '"':
+                result.append(ch)
+                in_string = not in_string
+            elif ch == '\n' and in_string:
+                result.append('\\n')
+            elif ch == '\r' and in_string:
+                result.append('\\r')
+            else:
+                result.append(ch)
+        return ''.join(result)
 
     def _parse_json_response(self, text: str) -> dict:
         """Robustly parse JSON from Gemini response, handling markdown fences."""
@@ -165,6 +175,15 @@ class GeminiClient:
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3]
         cleaned = cleaned.strip()
+
+        # Fix literal newlines inside JSON string values
+        cleaned = self._fix_json_newlines(cleaned)
+
+        # Replace JS-style undefined with null
+        cleaned = re.sub(r':\s*undefined\b', ': null', cleaned)
+
+        # Remove trailing commas before ] or }
+        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
 
         try:
             return json.loads(cleaned)
@@ -188,90 +207,75 @@ class GeminiClient:
     async def validate_document(self, doc_path: str, guideline_path: str) -> dict:
         """
         Stage 1: Primary regulatory validation.
-        Uploads documents to Gemini and performs clause-level compliance analysis.
-        Handles Word docs by converting them to text first.
+        Sends documents inline to Vertex AI Express Mode for clause-level compliance analysis.
+        Handles Word docs by converting them to plain text first.
         """
-        temp_files = []
-        
         # Process Document
         doc_ext = os.path.splitext(doc_path)[1].lower()
         if doc_ext in [".docx", ".doc", ".dcx"]:
-            logger.info(f"Processing Word document as text: {doc_path}")
+            logger.info(f"Converting Word document to text: {doc_path}")
             text = await self._get_docx_text(doc_path)
-            # Save to temporary .txt for upload
-            temp_txt_path = doc_path + ".converted.txt"
-            with open(temp_txt_path, "w", encoding="utf-8") as f:
-                f.write(text)
-            doc_file = self._upload_file(temp_txt_path, "clinical_document_text")
-            temp_files.append(temp_txt_path)
+            doc_part = types.Part.from_bytes(data=text.encode("utf-8"), mime_type="text/plain")
         else:
-            doc_file = self._upload_file(doc_path, "clinical_document")
+            doc_part = self._file_to_part(doc_path)
 
         # Process Guideline
         gui_ext = os.path.splitext(guideline_path)[1].lower()
         if gui_ext in [".docx", ".doc", ".dcx"]:
-            logger.info(f"Processing Word guideline as text: {guideline_path}")
+            logger.info(f"Converting Word guideline to text: {guideline_path}")
             text = await self._get_docx_text(guideline_path)
-            temp_txt_path = guideline_path + ".converted.txt"
-            with open(temp_txt_path, "w", encoding="utf-8") as f:
-                f.write(text)
-            guideline_file = self._upload_file(temp_txt_path, "regulatory_guideline_text")
-            temp_files.append(temp_txt_path)
+            guideline_part = types.Part.from_bytes(data=text.encode("utf-8"), mime_type="text/plain")
         else:
-            guideline_file = self._upload_file(guideline_path, "regulatory_guideline")
+            guideline_part = self._file_to_part(guideline_path)
 
-        try:
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    logger.info(f"Running validation (attempt {attempt})...")
-                    
-                    response = self.client.models.generate_content(
-                        model=self.model_name,
-                        contents=[
-                            types.Content(
-                                parts=[
-                                    types.Part.from_uri(file_uri=guideline_file.uri, mime_type=guideline_file.mime_type),
-                                    types.Part.from_uri(file_uri=doc_file.uri, mime_type=doc_file.mime_type),
-                                    types.Part.from_text(text=VALIDATION_PROMPT)
-                                ]
-                            )
-                        ],
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_INSTRUCTION,
-                            temperature=0.1,
-                            top_p=0.95,
-                            max_output_tokens=8192,
-                            response_mime_type="application/json"
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                logger.info(f"Running validation (attempt {attempt})...")
+
+                response = await self.client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=[
+                        types.Content(
+                            role="user",
+                            parts=[
+                                guideline_part,
+                                doc_part,
+                                types.Part.from_text(text=VALIDATION_PROMPT)
+                            ]
+                        )
+                    ],
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        temperature=0.1,
+                        top_p=0.95,
+                        max_output_tokens=65536,
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                            disable=True
                         )
                     )
-                    
-                    result = self._parse_json_response(response.text)
+                )
 
-                    # Basic structural validation
-                    required_keys = {"compliance_score", "findings", "executive_summary"}
-                    if not required_keys.issubset(result.keys()):
-                        missing = required_keys - result.keys()
-                        raise ValueError(f"Response missing required keys: {missing}")
+                result = self._parse_json_response(response.text)
 
-                    if not isinstance(result["findings"], list):
-                        raise ValueError("findings must be a list")
+                required_keys = {"compliance_score", "findings", "executive_summary"}
+                if not required_keys.issubset(result.keys()):
+                    missing = required_keys - result.keys()
+                    raise ValueError(f"Response missing required keys: {missing}")
 
-                    logger.info(f"Validation complete: score={result.get('compliance_score')}, "
-                              f"findings={len(result.get('findings', []))}")
-                    return result
+                if not isinstance(result["findings"], list):
+                    raise ValueError("findings must be a list")
 
-                except Exception as e:
-                    logger.warning(f"Validation attempt {attempt} failed: {e}")
-                    if attempt == self.max_retries:
-                        raise
-                    time.sleep(2 ** attempt)
-        finally:
-            # Clean up temp text files
-            for tf in temp_files:
-                try:
-                    os.remove(tf)
-                except:
-                    pass
+                logger.info(f"Validation complete: score={result.get('compliance_score')}, "
+                            f"findings={len(result.get('findings', []))}")
+                return result
+
+            except Exception as e:
+                logger.warning(f"Validation attempt {attempt} failed: {e}")
+                if attempt == self.max_retries:
+                    raise
+                await asyncio.sleep(2 ** attempt)
 
     async def check_consistency(self, validation_result: dict) -> dict:
         """
@@ -283,13 +287,17 @@ class GeminiClient:
         )
 
         try:
-            response = self.client.models.generate_content(
+            response = await self.client.aio.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
                     temperature=0.1,
-                    response_mime_type="application/json"
+                    response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
                 )
             )
             return self._parse_json_response(response.text)
@@ -303,10 +311,3 @@ class GeminiClient:
                 "quality_score": None
             }
 
-    def cleanup_files(self, *file_refs):
-        """Clean up uploaded files from Gemini servers."""
-        for ref in file_refs:
-            try:
-                self.client.files.delete(name=ref.name)
-            except Exception:
-                pass
