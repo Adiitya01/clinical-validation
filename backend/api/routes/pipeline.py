@@ -220,9 +220,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 if row:
                     await websocket.send_json({"type": "status", "status": row["status"]})
 
-        # Keep connection open until client disconnects
+        import asyncio
+        # Keep connection open until client disconnects, send heartbeats to avoid Render 100s timeout
         while True:
-            await websocket.receive_text()
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "heartbeat"})
     except WebSocketDisconnect:
         manager.disconnect(session_id, websocket)
     except Exception:

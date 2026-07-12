@@ -113,9 +113,9 @@ MIME_MAP = {
 
 class GeminiClient:
     def __init__(self, model_name="gemini-2.5-flash"):
-        api_key = os.getenv("VERTEX_API_KEY")
+        api_key = os.getenv("VERTEX_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            raise ValueError("VERTEX_API_KEY environment variable is not set")
+            raise ValueError("VERTEX_API_KEY or GOOGLE_API_KEY environment variable is not set")
 
         # Vertex AI Express Mode: API key auth against the Vertex AI endpoint
         self.client = genai.Client(vertexai=True, api_key=api_key)
